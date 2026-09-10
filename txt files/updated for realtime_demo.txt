@@ -1,0 +1,117 @@
+import sounddevice as sd
+import numpy as np
+import torch
+import warnings
+from train import UNetDenoiseMask
+
+# Ignore warnings for clean terminal output during presentation
+warnings.filterwarnings('ignore')
+
+print("⚙️ Initializing Tactical Edge Processing Unit...")
+
+# --- 1. HARDWARE SETTINGS ---
+SR = 16000
+CHUNK_SIZE = 256      # 16ms Hop Size (Ultra-Low Latency)
+WINDOW_SIZE = 512     # STFT Window Size
+TIME_FRAMES = 256     # 4-second context window for the AI
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = UNetDenoiseMask().to(device)
+model.load_state_dict(torch.load("denoise_model.pth", map_location=device, weights_only=True))
+model.eval()
+
+# --- 2. GPU WARMUP ---
+print("🔥 Warming up RTX CUDA Cores...")
+dummy_input = torch.zeros(1, 1, 256, 256).to(device)
+with torch.no_grad():
+    _ = model(dummy_input)
+
+# --- 3. STREAMING BUFFERS ---
+audio_in_buffer = np.zeros(WINDOW_SIZE, dtype=np.float32)
+audio_out_buffer = np.zeros(WINDOW_SIZE, dtype=np.float32)
+mag_buffer = np.zeros((256, TIME_FRAMES), dtype=np.float32)
+window = np.hanning(WINDOW_SIZE)
+
+# Pre-calculate Military Bandpass
+bandpass = np.ones(256, dtype=np.float32)
+bandpass[:10] = 0.05   # Kills rumble
+bandpass[110:] = 0.10  # Kills hiss
+
+# --- 4. THE LIVE DSP CALLBACK ---
+def audio_callback(indata, outdata, frames, time_info, status):
+    global audio_in_buffer, audio_out_buffer, mag_buffer
+    
+    if status:
+        print(f"Stream Status: {status}")
+        
+    # 1. Analog to Digital (Mic Input)
+    new_chunk = indata[:, 0]
+    audio_in_buffer = np.roll(audio_in_buffer, -CHUNK_SIZE)
+    audio_in_buffer[-CHUNK_SIZE:] = new_chunk
+    
+    # 2. Windowing & STFT
+    windowed_audio = audio_in_buffer * window
+    stft_frame = np.fft.rfft(windowed_audio)
+    mag_frame = np.abs(stft_frame)[:256]
+    phase_frame = np.angle(stft_frame)
+    
+    # 3. Update AI Context Buffer (Sliding Window)
+    mag_buffer = np.roll(mag_buffer, -1, axis=1)
+    mag_buffer[:, -1] = mag_frame
+    
+    # 4. Edge AI Inference
+    with torch.no_grad():
+        input_tensor = torch.from_numpy(np.log1p(mag_buffer)).float().unsqueeze(0).unsqueeze(0).to(device)
+        predicted_mask = model(input_tensor).squeeze().cpu().numpy()
+        
+    # Extract only the current frame's mask
+    current_mask = predicted_mask[:, -1]
+    
+    # 5. 🔥 TACTICAL HYBRID DSP 🔥
+    tactical_mask = current_mask * bandpass
+    
+    if np.max(tactical_mask) < 0.15:
+        final_mag = mag_frame * 0.0  # Squelch Active
+    else:
+        final_mask = np.clip(tactical_mask, 0.03, 1.0) ** 2.0
+        
+        # TACTICAL AGC (AUTOMATIC GAIN CONTROL) - UPDATED
+        peak_energy = np.max(mag_frame * final_mask)
+        safe_limit = 12.0
+        
+        if peak_energy > safe_limit:
+            dynamic_boost = safe_limit / (peak_energy + 1e-6)
+        else:
+            dynamic_boost = 2.8
+            
+        final_mag = mag_frame * final_mask * dynamic_boost  # Safely boosted
+        
+    # 6. Digital to Analog (Reconstruction)
+    full_mag = np.append(final_mag, 0.0) # Add missing bin
+    complex_stft = full_mag * np.exp(1j * phase_frame)
+    reconstructed_window = np.fft.irfft(complex_stft) * window
+    
+    # Overlap-Add Logic (OLA)
+    audio_out_buffer = np.roll(audio_out_buffer, -CHUNK_SIZE)
+    audio_out_buffer[-CHUNK_SIZE:] = 0.0
+    audio_out_buffer += reconstructed_window
+    
+    # Tactical Anti-Clip Limiter
+    out_chunk = np.tanh(audio_out_buffer[:CHUNK_SIZE])
+    
+    # Send to Speaker/Headphones
+    outdata[:, 0] = out_chunk
+
+# --- 5. INITIATE HARDWARE LINK ---
+print("\n==================================================")
+print("🎙️  TACTICAL COMMS LINK ESTABLISHED")
+print("🎧  Make sure you are wearing headphones! (To prevent echo)")
+print("🔴  LIVE NOW - Speak into the microphone...")
+print("Press Ctrl+C to terminate the link.")
+print("==================================================\n")
+
+try:
+    with sd.Stream(samplerate=SR, blocksize=CHUNK_SIZE, channels=1, callback=audio_callback):
+        sd.sleep(1000000)
+except KeyboardInterrupt:
+    print("\nComms Link Terminated.")
