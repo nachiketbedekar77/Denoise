@@ -1,130 +1,152 @@
 import time
 import threading
+import queue
 import sounddevice as sd
 import numpy as np
 import torch
 import warnings
-from train import UNetDenoiseMask
+
+# 🔥 THE FIX: Import your actual heavy U-Net! 
+# (Ignore the yellow line in VS Code, your terminal will find this file perfectly)
+from train import UNetDenoiseMask 
 
 warnings.filterwarnings('ignore')
 
-# --- 1. STABLE LOW-LATENCY PARAMETERS ---
+# --- 1. HARDWARE & LATENCY PARAMETERS ---
 SR = 16000
-CHUNK_SIZE = 128       # 8.0 ms hop (Perfect for 75% overlap)
-WINDOW_SIZE = 512      # Matches N_FFT to prevent phase tearing/pulsing
-N_FFT = 512            # Required for 257 bins
-MODEL_FRAMES = 256     # Tensor width dimension expected by U-Net
+CHUNK_SIZE = 128       
+WINDOW_SIZE = 512      
+N_FFT = 512            
+MODEL_FRAMES = 256     
+
+# Cheat codes from your tests
+TARGET_RMS = 0.06492  
+OLA_FACTOR = 2.0      
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"🚀 Initializing Tactical AI Core on: {device}")
+
+# --- 2. THE REAL MODEL LOADING ---
 model = UNetDenoiseMask().to(device)
-model.load_state_dict(torch.load("denoise_model.pth", map_location=device, weights_only=True))
-model.eval()
+try:
+    # strict=True ensures it crashes immediately if weights don't match exactly!
+    model.load_state_dict(torch.load("denoise_model.pth", map_location=device, weights_only=True), strict=True)
+    model.eval()
+    print("✅ Model weights loaded PERFECTLY! AI is fully armed.")
+except Exception as e:
+    print(f"\n❌ FATAL ERROR: {e}")
+    print("Fix: Ensure 'train.py' and 'denoise_model.pth' are in this exact folder.")
+    exit() # Kill script so you don't hear random untrained noise
 
-# GPU Engine Warmup
-dummy_input = torch.zeros(1, 1, 256, MODEL_FRAMES, device=device)
+# Warmup GPU
 with torch.no_grad():
-    for _ in range(3):
-        _ = model(dummy_input)
+    for _ in range(3): _ = model(torch.zeros(1, 1, 256, MODEL_FRAMES, device=device))
 
-# --- 2. FAST BUFFERS & FILTERS ---
+# --- 3. THREADED QUEUES (Overflow Fix) ---
+# Increased maxsize to prevent "input overflow"
+audio_queue = queue.Queue(maxsize=200)
+out_queue = queue.Queue(maxsize=200)
+
+window = np.hanning(WINDOW_SIZE).astype(np.float32)
 in_buffer = np.zeros(WINDOW_SIZE, dtype=np.float32)
 out_buffer = np.zeros(WINDOW_SIZE, dtype=np.float32)
 mag_context = np.zeros((256, MODEL_FRAMES), dtype=np.float32)
-window = np.hanning(WINDOW_SIZE).astype(np.float32)
-
-# Smoothed Trackers
-short_energy = 0.001
-long_energy = 0.001
-prev_mask = np.zeros(256, dtype=np.float32)
-
-# Sub-band Filter (300Hz - 3400Hz)
-tactical_band = np.ones(256, dtype=np.float32)
-tactical_band[:10] = 0.02
-tactical_band[110:] = 0.05
 
 stop_event = threading.Event()
 
-# --- 3. HARDWARE STREAM CALLBACK ---
+# --- 4. FAST MICROPHONE CALLBACK ---
 def audio_callback(indata, outdata, frames, time_info, status):
-    global in_buffer, out_buffer, mag_context, short_energy, long_energy, prev_mask
+    # Removed print(status) to completely stop "input overflow" frame dropping
     
-    chunk = indata[:, 0].copy()
+    try:
+        audio_queue.put_nowait(indata[:, 0].copy())
+    except queue.Full:
+        pass
 
-    # --- STAGE 1: IMPULSE SUPPRESSOR (Relaxed for Speech) ---
-    pwr = np.dot(chunk, chunk) / CHUNK_SIZE + 1e-7
-    short_energy = 0.8 * short_energy + 0.2 * pwr
-    long_energy = 0.99 * long_energy + 0.01 * pwr
-    transient_score = short_energy / (long_energy + 1e-7)
+    try:
+        outdata[:, 0] = out_queue.get_nowait()
+    except queue.Empty:
+        outdata[:, 0] = 0.0
 
-    # Threshold set to 6.0 so loud human voice survives easily
-    if transient_score > 6.0:
-        scale = np.sqrt(6.0 / transient_score)
-        chunk = np.tanh(chunk * scale) * 0.8
-
-    # --- STAGE 2: OLA INPUT ---
-    in_buffer = np.roll(in_buffer, -CHUNK_SIZE)
-    in_buffer[-CHUNK_SIZE:] = chunk
+# --- 5. THE AI WORKER THREAD ---
+def ai_worker_thread():
+    global in_buffer, out_buffer, mag_context
     
-    windowed = in_buffer * window
-    stft_res = np.fft.rfft(windowed, n=N_FFT)
-    mag = np.abs(stft_res)[:256]
-    phase = np.angle(stft_res)[:256]
+    while not stop_event.is_set():
+        try:
+            chunk = audio_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
 
-    # --- STAGE 3: INFERENCE ---
-    mag_context = np.roll(mag_context, -1, axis=1)
-    mag_context[:, -1] = mag
+        # RMS PRE-SCALER
+        current_rms = np.sqrt(np.mean(chunk**2)) + 1e-8
+        
+        if current_rms < 0.001:
+            out_queue.put(np.zeros(CHUNK_SIZE, dtype=np.float32))
+            continue
+            
+        scale_factor = TARGET_RMS / current_rms
+        scaled_chunk = chunk * scale_factor
 
-    with torch.no_grad():
-        x = torch.from_numpy(np.log1p(mag_context)).float().unsqueeze(0).unsqueeze(0).to(device)
-        mask = model(x).squeeze(0).squeeze(0)[:, -1].cpu().numpy()
+        # OLA SHIFT IN
+        in_buffer = np.roll(in_buffer, -CHUNK_SIZE)
+        in_buffer[-CHUNK_SIZE:] = scaled_chunk
+        
+        windowed = in_buffer * window
+        stft_res = np.fft.rfft(windowed, n=N_FFT)
+        mag = np.abs(stft_res)[:256]
+        phase = np.angle(stft_res)[:256]
 
-    # --- STAGE 4: REFINED DUAL GATING ---
-    mask = mask * tactical_band
+        mag_context = np.roll(mag_context, -1, axis=1)
+        mag_context[:, -1] = mag
 
-    # Smoother temporal transition to kill the pulse effect
-    alpha = 0.5 
-    mask = (alpha * mask) + ((1.0 - alpha) * prev_mask)
-    prev_mask = mask.copy()
+        # INFERENCE
+        with torch.no_grad():
+            x = torch.from_numpy(np.log1p(mag_context)).float().unsqueeze(0).unsqueeze(0).to(device)
+            mask = model(x).squeeze(0).squeeze(0)[:, -1].cpu().numpy()
 
-    # Impulse Clamp for gunshots
-    if transient_score > 6.0:
-        mask *= 0.4
+        # 🔥 TACTICAL SQUELCH & WIENER FILTERING
+        peak_conf = np.percentile(mask, 95)
+        
+        if peak_conf < 0.30:  
+            cleaned_mag = mag * 0.0
+        else:
+            # Pro-DSP Math[cite: 3]
+            smooth_mask = np.clip(mask, 0.02, 1.0)
+            cleaned_mag = mag * (smooth_mask ** 2.0) * 2.2
 
-    # Lowered squelch threshold (0.08) so quiet human words don't get choked
-    speech_energy = np.percentile(mask, 90)
-    if speech_energy < 0.08:
-        cleaned_mag = mag * 0.02 
-    else:
-        smooth_mask = np.clip(mask, 0.05, 1.0)
-        # Boost gain to 2.0 for louder, clear output
-        cleaned_mag = mag * ((smooth_mask ** 1.5) * 2.0)
+        # RECONSTRUCTION
+        stft_synth = np.zeros(257, dtype=np.complex64)
+        stft_synth[:256] = cleaned_mag * np.exp(1j * phase)
+        reconstructed = np.fft.irfft(stft_synth, n=N_FFT)
+        
+        # 🛠️ REVERSE SCALING & OLA MATH FIX
+        reconstructed = reconstructed / scale_factor
+        reconstructed = (reconstructed * window) / OLA_FACTOR
 
-    # --- STAGE 5: PERFECT OVERLAP-ADD SYNTHESIS ---
-    stft_synth = np.zeros(257, dtype=np.complex64)
-    stft_synth[:256] = cleaned_mag * np.exp(1j * phase)
-    
-    # Do NOT slice this! Keep all 512 points for proper overlap
-    reconstructed = np.fft.irfft(stft_synth, n=N_FFT) * window
+        out_buffer = np.roll(out_buffer, -CHUNK_SIZE)
+        out_buffer[-CHUNK_SIZE:] = 0.0
+        out_buffer += reconstructed
 
-    out_buffer = np.roll(out_buffer, -CHUNK_SIZE)
-    out_buffer[-CHUNK_SIZE:] = 0.0
-    out_buffer += reconstructed
+        final_out = np.tanh(out_buffer[:CHUNK_SIZE])
+        
+        # Safely push to headphone
+        try:
+            out_queue.put_nowait(final_out)
+        except queue.Full:
+            pass
 
-    # Analog Soft-Clipper via hyperbolic tangent
-    outdata[:, 0] = np.tanh(out_buffer[:CHUNK_SIZE] * 0.85)
+# --- 6. START RUNTIME ---
+print("\n" + "="*55)
+print(f"⚡ TRUE THREADED CORE | RMS: {TARGET_RMS} | OLA: {OLA_FACTOR}")
+print("="*55 + "\n")
 
-# --- 4. START RUNTIME ---
-print("\n=======================================================")
-print("⚡ TACTICAL CORE RUNNING (STABLE OLA PHASE)")
-print(f"⏱️ Algorithmic Latency: {(CHUNK_SIZE/SR)*1000:.2f} ms")
-print("🔥 RTX 3050 Tensor Acceleration: Active")
-print("🔴 Press Ctrl+C to terminate safely.")
-print("=======================================================\n")
+worker = threading.Thread(target=ai_worker_thread, daemon=True)
+worker.start()
 
 try:
     with sd.Stream(samplerate=SR, blocksize=CHUNK_SIZE, channels=1, callback=audio_callback):
-        # Non-blocking loop so Ctrl+C works instantly
-        while not stop_event.is_set():
+        while True:
             time.sleep(0.1)
 except KeyboardInterrupt:
     print("\n[!] Edge stream safely terminated by user.")

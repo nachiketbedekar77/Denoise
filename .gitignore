@@ -1,8 +1,28 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.pyc
-.venv/
-venv/
-.env
+*.pyd
 
+# Virtual Environments
+anc_env/
+venv/
+env/
+
+# Model Weights (Upload these to GitHub Releases separately)
+*.pth
+denoise_model.pth
+
+# Local Datasets & Raw Audio Storage
 Dataset/
 Raw-data/
+
+# Audio Outputs & Test Logs
+*.wav
+
+# Generated Dashboard Plots & Proof Images
+*.png
+
+# IDE & OS-specific files
+.vscode/
+.DS_Store
+Thumbs.db

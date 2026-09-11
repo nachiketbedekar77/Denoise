@@ -1,0 +1,7 @@
+{
+  "target_rms": 0.06491532235531683,
+  "mean_rms": 0.06698451854529024,
+  "std_rms": 0.03030335679436713,
+  "n_files": 2703,
+  "source_dir": "dataset\\noisy_audio"
+}
